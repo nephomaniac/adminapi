@@ -1,4 +1,6 @@
 # adminapi
+This project has moved to:https://github.com/eucalyptus/adminapi
+===
 
 Eucalyptus Cloud Services and General System Administrative Utilities
 
