@@ -60,6 +60,7 @@ class EucalyptusConf(Namespace):
             lines = str(lines).splitlines()
         unparsedlines = ""
         for line in lines:
+            match = None
             line.strip()
             if not re.match('^#', line):
                 match = re.search('^(\w+)=\s*(\S+)$', line)
