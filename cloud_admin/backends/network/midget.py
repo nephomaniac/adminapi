@@ -1,4 +1,8 @@
 from midonetclient.api import MidonetApi
+from midonetclient import api_lib
+from midonetclient import exc as mido_exc
+from webob import exc
+from midonetclient.api_lib import http_errors, from_json
 from midonetclient.router import Router
 from midonetclient import resource_base
 from midonetclient import vendor_media_type
@@ -8,22 +12,41 @@ from midonetclient.host import Host
 from midonetclient.host_interface_port import HostInterfacePort
 from midonetclient.host_interface import HostInterface
 from midonetclient.ip_addr_group import IpAddrGroup
-from cloud_utils.net_utils.sshconnection import SshConnection
-from cloud_utils.net_utils import is_address_in_network
-from cloud_utils.log_utils import markup
+from cloud_utils.net_utils import is_address_in_network, sshconnection
+from cloud_utils.log_utils import markup, get_traceback, red
+from cloud_utils.log_utils import BackGroundColor, TextStyle, ForegroundColor
 from cloud_utils.log_utils.eulogger import Eulogger
+from cloud_utils.system_utils.machine import Machine
 from cloud_admin.systemconnection import SystemConnection
+from distutils.version import StrictVersion
 from boto.ec2.group import Group as BotoGroup
 from boto.ec2.instance import Instance
 from boto.ec2.securitygroup import SecurityGroup, IPPermissions
-from prettytable import PrettyTable
+from ConfigParser import ConfigParser, NoOptionError, NoSectionError
+from httplib import CannotSendRequest
+from io import StringIO
 from json import loads as json_loads
-import requests
+from kazoo.client import KazooClient
+from prettytable import PrettyTable
+import json
+import pkg_resources
 import socket
-import struct
 import time
+from urllib import urlencode
+import urllib2
 import re
 import copy
+"""
+versions() borrowed from:
+http://stackoverflow.com/questions/4888027/
+python-and-pip-list-all-versions-of-a-package-thats-available
+"""
+def versions(package_name):
+    url = "https://pypi.python.org/pypi/%s/json" % (package_name,)
+    data = json.load(urllib2.urlopen(urllib2.Request(url)))
+    versions = data["releases"].keys()
+    versions.sort(key=StrictVersion)
+    return versions
 
 
 class ArpTable(resource_base.ResourceBase):
@@ -66,23 +89,54 @@ class Midget(object):
     _ADDR_SPACING = 22
 
     def __init__(self, midonet_api_host, midonet_api_port='8080', midonet_username=None,
-                 midonet_password=None, clc_ip=None, clc_password=None, systemconnection=None):
+                 midonet_password=None, clc_ip=None, clc_password=None, systemconnection=None,
+                 clc_tunnel=True, clc_tunnel_host='127.0.0.1', mido_log_level='INFO',
+                euca_log_level='INFO'):
+        """
+
+        :param midonet_api_host: IP/hostname of machine serving midonet api
+        :param midonet_api_port: tcp port for midonet api
+        :param midonet_username: midonet api login username
+        :param midonet_password: midonet api login password
+        :param clc_ip: IP/Hostname of Eucalyptus CLC used to create a euca SystemConnection().
+        :param clc_password: ssh password of Eucalyptus CLC (if not using ssh key)
+        :param systemconnection: A Eucalyptus System Connection object.
+        :param clc_tunnel: Bool, if true will tunnel mido http requests through CLC.
+        :param clc_tunnel_host: ip/hostname to use for tunneled api host destination, default is
+                                '127.0.0.1' relative to the CLC.
+        :param mido_log_level: Loglevel for this mid-get object
+        :param euca_log_level: Loglevel used if 'creating' a euca systemconnection object.
+        """
         self.midonet_api_host = midonet_api_host
         self.midonet_api_port = midonet_api_port
         self.midonet_username = midonet_username
         self.midonet_password = midonet_password
+        self._host_connections = {}
+
+        self.log = Eulogger(identifier='MidoDebug:{0}'.format(self.midonet_api_host),
+                            stdout_level=mido_log_level,
+                            parent_logger_name=self.__class__.__name__)
+        if clc_tunnel:
+            clc_ip = clc_ip or midonet_api_host
+            self.midonet_api_host = clc_tunnel_host
+            api_lib.do_request = self.tunneled_request
         self.mapi = MidonetApi(base_uri='http://{0}:{1}/midonet-api'
                                .format(self.midonet_api_host, self.midonet_api_port),
                                username=self.midonet_username, password=self.midonet_password)
-
         self.eucaconnection = systemconnection
         if not self.eucaconnection:
-            clc_ip = clc_ip or midonet_api_host
-            self.eucaconnection = SystemConnection(hostname=clc_ip, password=clc_password)
-        self.log = Eulogger(identifier='MidoDebug:{0}'.format(self.midonet_api_host))
+            clc_ip = clc_ip
+            self.eucaconnection = SystemConnection(hostname=clc_ip, password=clc_password,
+                                                   log_level=euca_log_level)
+        try:
+            self.check_mido_client_to_server_versions()
+        except Exception as E:
+            self.log.debug('{0}\nError while checking mido version:{1}'.format(get_traceback(), E))
+
         self.default_indent = ""
         self._euca_instances = {}
         self._protocols = {}
+        self._api_version_cache = {}
 
     def debug(self, msg):
         self.log.debug(msg)
@@ -90,7 +144,256 @@ class Midget(object):
     def info(self, msg):
         self.log.info(msg)
 
+    def check_mido_client_to_server_versions(self, rpm_string=None):
+        mido_rpm = rpm_string
+        if not mido_rpm:
+            mido_rpm = self.eucaconnection.clc_machine.sys('rpm -qa midonet-cluster',
+                                                           listformat=False).strip()
+        if not mido_rpm:
+            mido_rpm = self.eucaconnection.clc_machine.sys('rpm -qa midolman',
+                                                           listformat=False).strip()
+        if not mido_rpm:
+            self.log.warning(red('Midonet may not be installed on the expected host:{0}'
+                                 .format(self.eucaconnection.clc_machine.hostname)))
+            return None
+        client_versions = versions('midonetclient')
+        if not client_versions:
+            self.log.warning(red('No midonetclient python client versions found to check against'
+                               'installed pkgs?'))
+            return None
+        current_client_ver = pkg_resources.get_distribution("midonetclient").version
+        matches = []
+        client_nums = []
+        max = 0
+        self.log.debug('Looking for best client fit. Client vers:"{0}", pkg ver:"{1}"'
+                       .format(", ".join(client_versions), mido_rpm))
+
+        for ver in client_versions:
+            client_num = ver.split('.')
+            client_nums.append(client_num)
+            if len(client_num) > max:
+                max = len(client_num)
+
+        for x in xrange(0, max):
+            for ver in client_nums:
+                if len(ver) >= x:
+                    verstr = ".".join(ver[0:(len(ver) - x)])
+                    if verstr and re.search(verstr, mido_rpm):
+                        matches.append(".".join(ver))
+            if matches:
+                break
+        self.log.debug('Pkg:"{0}", possible clients matches:"{1}"'
+                       .format(mido_rpm, ",".join(matches)))
+        if current_client_ver in matches:
+            self.log.debug('Current midonet client ver:{0} seems to be a good fit for:{1}'
+                           .format(current_client_ver, mido_rpm))
+        else:
+            self.log.warning(red('Mido version:"{0}" may not be compatible with Midolman '
+                                 'pkg version found:{1}.\n'
+                                 'See available versions using: '
+                                 '"pip search midonetclient"\n"'
+                                 'Install with:\n'
+                                 '"pip install midonetclient==<correct version>"'
+                                 .format(current_client_ver, mido_rpm)))
+
+
+    def set_mido_log_level(self, level):
+        """
+        Sets the log level on the mid-get operations
+        note the parent log level may also need to be adjusted.
+        To adjust the parent logger, use: self.set_euca_loglevel,
+        or set directly self.log.parent...
+        :param level: logging level integer or name (debug, info, etc)
+        :return:
+        """
+        self.log.set_stdout_loglevel(level)
+
+    def set_euca_parent_log_level(self, level):
+        level = self.log.format_log_level(level, default=None)
+        if level is None:
+            raise ValueError('Unknown and/or invalid log level: "{0}"'.format(level))
+        self.log.parent.level = level
+
+    def tunneled_request(self, uri, method, body=None, query=None, headers=None,
+                         ssh_host=None, depth=0, max_redirects=5, mido_json_ver=None,
+                         mido_api_request_type = None,
+                         *args, **kwargs):
+        """
+        Process a http rest request with input and output json strings.
+
+        Sends json string serialized from body to uri with verb method and returns
+        a 2-tuple made of http response, and content deserialized into an object.
+        :param uri: URI of request http://addr/path etc
+        :param method: http method, GET, POST, etc
+        :param body: option body of request
+        :param query: query params, dict
+        :param headers: headers, dict
+        :param ssh_host: An SshConnection obj to tunnel requests through. Default is the CLC.
+        :param depth: current amount of redirects for this request
+        :param max_redirects: max amount of redirects allowed for this request
+        :return: (http response obj, data as json).
+        """
+
+        # Try to find an acceptable json version for the api request...
+        # First see if this type of request has already been successful or not with a previous
+        # version in a request...
+        trying_version = None
+        original_version = None
+        header_key = None
+        header_value = None
+        # See if this contains the 'Accept' header...
+        if isinstance(headers, dict):
+            for header_key, header_value in headers.iteritems():
+                if str(header_key).lower() == 'accept':
+                    break
+        if header_value:
+            # If the mido request type string wasn't provided, find it in the uri and header...
+            # Example: "BRIDGES.PORT"
+            if uri and not mido_api_request_type:
+                # Use the request and header request types for future caching...
+                uri_match = re.search(r"(http.*midonet-api)/(\w+)/*(.*$)", uri)
+                if uri_match:
+                    uri_type = uri_match.groups()[1]
+                    h_match = re.search(r'\.(\w+)-v\d\+json$', header_value)
+                    if h_match:
+                        header_type = h_match.groups()[0]
+                        mido_api_request_type = "{0}.{1}".format(uri_type, header_type).upper()
+
+            if mido_api_request_type:
+                # if the version wasn't supplied in the request, see if it's cached already...
+                if mido_json_ver is None:
+                    mido_json_ver = self._api_version_cache.get(mido_api_request_type, None)
+                match = re.search('v(\d)\+json$', header_value)
+                if match:
+                    original_version = match.groups()[0]
+                    trying_version = original_version
+                    if mido_json_ver is not None and mido_json_ver != original_version:
+                        new_string = header_value.replace("v{0}+json".format(original_version),
+                                                   "v{0}+json".format(mido_json_ver))
+                        headers[header_key] = new_string
+                        trying_version = mido_json_ver
+        if depth > max_redirects:
+            raise ValueError('Request detph:{0} has exceed max_redirects:{1}, uri:{2}'
+                             .format(depth, max_redirects, uri))
+        ssh_host = ssh_host or self.eucaconnection.clc_machine.ssh
+        if not ssh_host:
+            raise ValueError('tunneled request requires an SshConnection. None provided and '
+                             'could not find clc ssh host in self.eucaconnection')
+        elif not isinstance(ssh_host, sshconnection.SshConnection):
+            raise ValueError('ssh_host must be of type SshConnection, got: "{0}/{1}'
+                             .format(ssh_host, type(ssh_host)))
+        query = query or dict()
+        headers = headers or dict()
+        response = None
+        content = None
+        status = -1
+        self.log.debug("tunneled request: uri=%s, method=%s" % (uri, method))
+        self.log.debug("tunneled request: body=%s" % body)
+        self.log.debug("tunneled request: headers=%s" % headers)
+        self.log.debug("tunneled request:mido_request_type:{0}, original ver:{1}, "
+                       "trying ver:{2}"
+                       .format(mido_api_request_type, original_version, trying_version))
+        if query:
+            uri += '?' + urlencode(query)
+        data = json.dumps(body) if body is not None else '{}'
+
+        try:
+            response = ssh_host.http_fwd_request(url=uri, method=method, body=data,
+                                                 headers=headers)
+            content = response.read()
+            status = response.status
+        except socket.error as serr:
+            if serr[1] == "ECONNREFUSED":
+                raise mido_exc.MidoApiConnectionRefused()
+            raise
+        except CannotSendRequest as CSE:
+            self.log.error('{0}\nCould not send request to midonet-api, err:"{1}"'
+                           .format(get_traceback(), CSE))
+            raise mido_exc.MidoApiConnectionRefused()
+
+        self.log.debug("do_request: response=%s | content=%s" % (response, content))
+        if int(status == 302):
+            self.log.info('302 response')
+            location = response.getheader('location')
+            if location and location != uri:
+                self.log.info('Redirecting: to url:{0}'.format(location))
+                depth += 1
+                return self.tunneled_request(uri=location, method=method,
+                                             body=body, query=query, headers=headers,
+                                             ssh_host=ssh_host, depth=depth,
+                                             max_redirects=max_redirects)
+        if int(status) > 400:
+            error = http_errors.get(str(status), None)
+            if not error:
+                error = RuntimeError
+            self.log.error("Got http error(response=%r, content=%r) for "
+                           "request(uri=%r, method=%r, body=%r, query=%r,headers=%r). "
+                           "Exception type=%r" % (response, content, uri, method, body,
+                                                     query, headers, error))
+            if int(status) == 406:
+                if trying_version and trying_version > 0:
+                    new_version = int(trying_version) - 1
+                    self.log.error(red('ErrorCode:406.  Request type:{0}, Current Ver:{1}, '
+                                       'Retrying with version:{2}'.format(mido_api_request_type,
+                                                                          trying_version,
+                                                                          new_version)))
+                    return self.tunneled_request(uri=uri, method=method,
+                                                 body=body, query=query, headers=headers,
+                                                 ssh_host=ssh_host, depth=depth,
+                                                 max_redirects=max_redirects,
+                                                 mido_api_request_type=mido_api_request_type,
+                                                 mido_json_ver=new_version)
+            raise error
+        # Request was valid store the api version for future requests...
+        if trying_version:
+            self._api_version_cache[mido_api_request_type] = trying_version
+        return response, from_json(content)
+
+    def mido_cli_cmd(self, cmd, ssh=None, midonet_url='http://127.0.0.1:8080/midonet-api',
+                     listformat=True, verbose=True, no_auth=True, username=None, password=None,
+                     tenant=None):
+        """
+        Attempts to execute a midocli command on a remote ssh connected machine and
+        return the results
+
+        :return:
+        :param cmd: a string representing the command to feed to midocli
+        :param ssh: a adminapi net_utils.sshconnection object
+        :param midonet_url: url to be fed to midocli
+        :param no_auth: if true will pass no_auth flag to midonet
+        :param verbose: bool, set verbose flag for underlying ssh sys command
+        :param listformat: bool, if true returns list of lines else a single string buffer
+        :param username: username for midonet auth
+        :param password: password for midonnet auth
+        :param tenant: midonet tenantid, uuid
+        :return: output from command
+        """
+        try:
+            ssh = ssh or self.eucaconnection.clc_machine.ssh
+        except:
+            raise ValueError('sshconnection object was not provided and not found in the'
+                             'local eucaconnection object')
+        command_prefix = 'midonet-cli --midonet-url={0} '.format(midonet_url)
+        if no_auth:
+            command_prefix += ' --no-auth '
+        if username:
+            command_prefix += ' --user={0} '.format(username)
+        if password:
+            command_prefix += ' --password={0} '.format(password)
+        if tenant:
+            command_prefix += ' --tenant={0} '.format(tenant)
+
+        cmd = command_prefix + str(cmd)
+        return ssh.sys(cmd=cmd, listformat=listformat, verbose=verbose)
+
+
     def _indent_table_buf(self, table, indent=None):
+        """
+        Used to offset a table when printed
+        :param table: Prettytable obj
+        :param indent: string to prepend as indentation
+        :return: string buffer
+        """
         if indent is None:
             indent = self.default_indent
         buf = str(table)
@@ -100,6 +403,13 @@ class Midget(object):
         return ret_buf
 
     def _link_table_buf(self, table, indent=4):
+        """
+        Created an ascii arrow or link to a table within a table.
+        This is used when a row within a table needs to be expanded into a sub-table.
+        :param table: pretty table obj
+        :param indent: int, number of spaces to indent
+        :return: resulting table string/buffer
+        """
         if not table:
             return None
         if indent < 2:
@@ -119,15 +429,25 @@ class Midget(object):
         return ret_buf
 
     def _errmsg(self, text):
-        self.info(self._bold(text), 101)
+        """
+        Used for logging errors with ascii markups.
+        :param text: msg to be logged.
+        """
+        self.log.error(markup(text, [TextStyle.BOLD, ForegroundColor.RED]))
 
     def _header(self, text):
-        return markup(text=text, markups=[1, 94])
+        return markup(text=text, markups=[TextStyle.BOLD, ForegroundColor.BLUE])
 
     def _bold(self, text, value=1):
-        return markup(text=text, markups=[value])
+        return markup(text=text, markups=[TextStyle.BOLD])
 
     def _highlight_buf_for_instance(self, buf, instance):
+        """
+        Highlight substrings that match information contained in a boto instance obj.
+        :param buf: string buffer
+        :param instance: boto instance obj
+        :return: marked up string buffer
+        """
         ret_buf = ""
         for line in str(buf).splitlines():
             searchstring = "{0}|{1}|{2}".format(instance.id,
@@ -147,6 +467,10 @@ class Midget(object):
 
     @property
     def protocols(self):
+        '''
+        Dict mapping of ip protocol names to numbers
+        :return: dict
+        '''
         if not self._protocols:
             proto_dict = {}
             for attr in dir(socket):
@@ -160,6 +484,12 @@ class Midget(object):
         return self.protocols.get(str(number), str(number))
 
     def _get_instance(self, instance):
+        """
+        Sanitize a value (ie usually an instance id or an instance obj) to return an
+        instance obj
+        :param instance: value to be checked, and or converted to a boto instance
+        :return: boto instance
+        """
         fetched_ins = None
         if not isinstance(instance, Instance):
             if isinstance(instance, basestring):
@@ -265,6 +595,11 @@ class Midget(object):
         return routers
 
     def get_router_for_instance(self, instance):
+        """
+        Fetch the midonet router obj for this instance
+        :param instance: either instance id or boto instance obj
+        :return: mido router obj
+        """
         instance = self._get_instance(instance)
         self.info('Getting router for instance:{0}, vpc:{1}'.format(instance.id, instance.vpc_id))
         routers = self.get_all_routers(search_dict={'name': instance.vpc_id})
@@ -276,6 +611,11 @@ class Midget(object):
         return router
 
     def get_router_by_name(self, name):
+        """
+        Fetch a midonet router by it's name
+        :param name: string, name of router
+        :return: mido router obj or None
+        """
         assert name
         search_string = "^{0}$".format(name)
         self.info('Using Search String:{0}'.format(search_string))
@@ -423,13 +763,19 @@ class Midget(object):
     def get_router_port_for_subnet(self, router, cidr):
         assert cidr
         for port in router.get_ports():
-            network = "{0}/{1}".format(port.get_network_address(), port.get_network_length())
+            network = "{0}/{1}".format(port.dto.get('networkAddress', None), port.dto.get('networkLength', None))
             if str(network) == str(cidr):
                 return port
         return None
 
     def get_bridge_for_instance(self, instance):
         instance = self._get_instance(instance)
+        bridge_name = "vb_{0}_{1}".format(instance.vpc_id, instance.subnet_id)
+        bridge = self.get_bridge_by_name(bridge_name)
+        if bridge:
+            return bridge
+        self.log.debug('Did not find bridge by name:"{0}", trying by port, cidr...'
+                       .format(bridge_name))
         router = self.get_router_for_instance(instance)
         if not router:
             raise ValueError('Did not find router for instance:{0}'.format(instance.id))
@@ -448,6 +794,45 @@ class Midget(object):
                              'fix the assumptions made in this method!')
         return bridge
 
+    def get_bridge_by_name(self, name):
+        for bridge in self.mapi.get_bridges(None):
+            if bridge.get_name() == name:
+                return bridge
+        return None
+
+    def get_bridge_for_subnet(self, subnet):
+        if isinstance(subnet, basestring):
+            subnets = self.eucaconnection.ec2_connection.get_all_subnets(['verbose', subnet])
+            if not subnets:
+                raise ValueError('SUBNET not found for string:{0}'.format(subnet))
+            subnet = subnets[0]
+        bridge_name = "vb_{0}_{1}".format(subnet.vpc_id, subnet.id)
+        return self.get_bridge_by_name(bridge_name)
+
+    def get_bridge_for_eni(self, eni):
+        if isinstance(eni, basestring):
+            enis = self.eucaconnection.ec2_connection.get_all_network_interfaces(['verbose', eni])
+            if not enis:
+                raise ValueError('ENI not found for string:{0}'.format(eni))
+            else:
+                eni = enis[0]
+        bridge_name = "vb_{0}_{1}".format(eni.vpc_id, eni.subnet_id)
+        return self.get_bridge_by_name(bridge_name)
+
+    def get_bgps_for_port(self, port):
+        bgps = []
+        if hasattr(port, 'get_bgps'):
+            bgps = port.get_bgps()
+        elif port.dto.get('bgps', None):
+            header = (getattr(vendor_media_type,
+                              'APPLICATION_BGP_COLLECTION_JSON', None) or
+                      "application/vnd.org.midonet.collection.Bgp-v1+json")
+            bgps = port.auth.do_request(headers={'Accept': header},
+                                        method='GET',
+                                        uri=port.dto.get('bgps'))
+        return bgps
+
+
     def show_port_summary(self, port, showchains=True, showbgp=True, indent=None, printme=True):
         if indent is None:
             indent = self.default_indent
@@ -461,28 +846,41 @@ class Midget(object):
         pt.max_width['PEER ID'] = 20
         bgps = 0
         try:
-            if port.dto.get('bgps'):
-                bgps = port.get_bgps()
+            if port.dto.get('bgps', None):
+                bgps = self.get_bgps_for_port(port)
                 if bgps:
                     bgps = len(bgps)
                 else:
                     bgps = 0
+            elif port.dto.get('bgpStatus', None):
+                bgps = True
         except Exception, E:
             bgps = 'ERROR'
             self.info('Error fetching bgps from port:{0}, err"{1}'.format(port.get_id(), E))
-
+        if port.dto.get('networkAddress', None) is not None:
+            netaddr = "{0}/{1}".format(port.dto.get('networkAddress', None),
+                                       port.dto.get('networkLength', None))
+        else:
+            netaddr = None
         pt.add_row([port.get_id(),
                     bgps,
-                    port.get_port_address(),
-                    "{0}/{1}".format(port.get_network_address(), port.get_network_length()),
-                    port.get_port_mac(),
+                    port.dto.get('portAddress', None),
+                    netaddr,
+                    port.dto.get('portMac', None),
                     port.get_type(),
                     port.get_admin_state_up(),
                     port.get_peer_id()])
         buf += self._indent_table_buf(str(pt))
         if showbgp and bgps:
-            buf += self._bold("{0}PORT BGP INFO:\n".format(indent), 4)
-            buf += self._indent_table_buf(str(self.show_bgps(port.get_bgps() or [])))
+            if port.dto.get('bgpStatus', None):
+                # 5.2 has bgpStatus
+                buf += self._bold("{0}PORT {1} BGP INFO:\n".format(indent, port.get_id()), 4)
+                buf += self._indent_table_buf(str(port.dto.get('bgpStatus')))
+            else:
+                #1.9 has bgps
+                buf += self._bold("{0}PORT BGP INFO:\n".format(indent), 4)
+                buf += self._indent_table_buf(str(self.show_bgps(self.get_bgps_for_port(port),
+                                                             printme=False)))
         if showchains:
             if port.get_inbound_filter_id():
                 in_filter = self.mapi.get_chain(str(port.get_inbound_filter_id()))
@@ -500,7 +898,7 @@ class Midget(object):
         else:
             return titlept
 
-    def show_ports(self, ports, printme=True):
+    def show_ports(self, ports, verbose=True, printme=True):
         """
         Show formatted info about a list of ports or a specific port.
         For more verbose info about a specific port use show_port_summary()
@@ -520,26 +918,31 @@ class Midget(object):
                 bgps = 0
                 try:
                     if port.dto.get('bgps'):
-                        bgps = port.get_bgps()
+                        bgps = self.get_bgps_for_port(port)
                         if bgps:
                             bgps = len(bgps)
                         else:
                             bgps = 0
+                    elif port.dto.get('bgpStatus', None):
+                        bgps = True
                 except Exception, E:
                     bgps = 'ERROR'
                     self.info('Error fetching bgps from port:{0}, err"{1}'
                               .format(port.get_id(), E))
                 pt.add_row([port.get_id(),
                             bgps,
-                            port.get_port_address(),
-                            "{0}/{1}".format(port.get_network_address(),
-                                             port.get_network_length()),
-                            port.get_port_mac(),
+                            port.dto.get('portAddress', None),
+                            "{0}/{1}".format(port.dto.get('networkAddress', None),
+                                             port.dto.get('networkLength', None)),
+                            port.dto.get('portMac', None),
                             port.get_type(),
                             port.get_admin_state_up(),
                             port.get_peer_id()])
-
-                if bgps and bgps != "ERROR":
+                outbound_filter_id = port.get_outbound_filter_id()
+                inbound_filter_id = port.get_inbound_filter_id()
+                # Append bgp and filter to table
+                if (bgps and bgps != "ERROR") or (verbose and
+                                                      (outbound_filter_id or inbound_filter_id)):
                     lines = []
                     for line in str(pt).splitlines():
                         line = line.strip()
@@ -548,14 +951,56 @@ class Midget(object):
                     # footer = lines[-1]
                     buf += "\n".join(lines) + '\n'
                     pt = None
-                    buf += self._link_table_buf(self.show_bgps(port.get_bgps(), printme=False))
-                    # buf += footer + '\n'
+                    if outbound_filter_id:
+                        buf += self._link_table_buf(
+                            "PORT:{0} OUTBOUND FILTER:\n{1}"
+                                .format(port.get_id(),
+                                        self.show_chain(self.mapi.get_chain(outbound_filter_id),
+                                                        printme=False)))
+                    if inbound_filter_id:
+                        buf += self._link_table_buf(
+                            "PORT:{0} INBOUND FILTER:\n{1}"
+                                .format(port.get_id(),
+                                        self.show_chain(self.mapi.get_chain(inbound_filter_id),
+                                                        printme=False)))
+                    if bgps:
+                        if port.dto.get('bgpStatus', None):
+                            buf += self._link_table_buf(str(port.dto.get('bgpStatus')))
+                        else:
+                            buf += self._link_table_buf(self.show_bgps(self.get_bgps_for_port(port),
+                                                                       printme=False))
+
             if pt:
                 buf += str(pt) + '\n'
         if printme:
             self.info('\n{0}\n'.format(buf))
         else:
             return buf
+
+    def show_bgp_hosts_for_euca_router(self, router_name='eucart', printmethod=None, printme=True):
+        ret_buf = ""
+        router = self.get_router_by_name(router_name)
+        bgp_ports = []
+        for port in router.get_ports():
+            if self.get_bgps_for_port(port):
+                bgp_ports.append(port)
+        bgp_hosts = []
+        for port in bgp_ports:
+            host = self.mapi.get_host(port.get_host_id())
+            if host:
+                bgp_hosts.append(host)
+            else:
+                self.log.error('No host found for port:{0} using host_id:{1}'
+                               .format(port.get_id(), port.get_host_id()))
+            port_table = str(self.show_port_summary(port=port, printme=False))
+            host_table = self.show_hosts(host, printme=False)
+            ret_buf += "\n{0}\n\n{1}\n{2}\n"\
+                .format("#".ljust(len(port_table.splitlines()[0]), "#"), port_table, host_table)
+        if printme:
+            printmethod = printmethod or self.log.info
+            printmethod("\n{0}\n".format(ret_buf))
+        else:
+            return ret_buf
 
     def show_bgps(self, bgps, printme=True):
         buf = ""
@@ -598,9 +1043,9 @@ class Midget(object):
             status_pt = PrettyTable(['PORT HOST:{0} ({1} : {2} : {3}/{4})'
                                      .format(hostname,
                                              interface_name,
-                                             port.get_port_address(),
-                                             port.get_network_address(),
-                                             port.get_network_length())])
+                                             port.dto.get('portAddress', None),
+                                             port.dto.get('networkAddress', None),
+                                             port.dto.get('networkLength', None))])
             status_pt.align = 'l'
             status_pt.vrules = 2
             status_pt.hrules = 3
@@ -670,6 +1115,18 @@ class Midget(object):
                 return instance
         return None
 
+    def show_bridge_for_euca_artifact(self, instance=None, subnet=None, eni=None,
+                                      indent=None, printme=True):
+        if instance:
+            bridge = self.get_bridge_for_instance(instance)
+        if subnet:
+            bridge = self.get_bridge_for_subnet(subnet)
+        if eni:
+            bridge = self.get_bridge_for_eni(eni)
+        return self.show_bridges(bridge, indent=indent, printme=printme)
+
+
+
     def show_bridges(self, bridges=None, indent=None, printme=True):
         if indent is None:
             indent = self.default_indent
@@ -683,7 +1140,7 @@ class Midget(object):
             buf = ""
             pt = PrettyTable(['BRIDGE NAME', 'ID', 'TENANT', 'Vx LAN PORT'])
             pt.add_row([bridge.get_name(), bridge.get_id(), bridge.get_tenant_id(),
-                        bridge.get_vxlan_port()])
+                        bridge.dto.get('vxLanPortId')])
             title = self._header('BRIDGE:"{0}"'.format(bridge.get_name()))
             box = PrettyTable([title])
             box.align[title] = 'l'
@@ -1239,7 +1696,7 @@ class Midget(object):
         if hosts is None:
             hosts = self.mapi.get_hosts(query=None)
         host_name_col = 'HOST NAME'
-        pt = PrettyTable(["HOST ID", host_name_col, "ALIVE", "HOST IP(S)"])
+        pt = PrettyTable(["HOST ID", host_name_col, "ALIVE", "HOST IP(S)", 'TUN ZONE'])
         for host in sorted(hosts, key=lambda host: host.get_name()):
             ip_addrs = 'not resolved'
             try:
@@ -1247,11 +1704,23 @@ class Midget(object):
                 ip_addrs = ", ".join(addresslist)
             except:
                 pass
-            pt.add_row([host.get_id(), host.get_name(), host.dto.get('alive'), ip_addrs])
+            tz = self.get_tunnel_zone_for_host(host)
+            if tz:
+                tz = tz.get_name()
+            pt.add_row([host.get_id(), host.get_name(), host.dto.get('alive'), ip_addrs, tz])
         if printme:
             self.info('\n{0}\n'.format(pt))
         else:
             return pt
+
+    def get_tunnel_zone_for_host(self, host):
+        tzs = self.get_tunnel_zones()
+        for tz in tzs:
+            for thosts in tz.get_hosts():
+                if thosts.get_host_id() == host.get_id():
+                    return tz
+        return None
+
 
     def show_hosts(self, hosts=None, printme=True):
         if hosts and not isinstance(hosts, list):
@@ -1279,8 +1748,9 @@ class Midget(object):
             return buf
 
     def get_ip_for_host(self, host):
-        assert isinstance(host, Host)
-        name, aliaslist, addresslist = socket.gethostbyaddr(host.get_name())
+        if isinstance(host, Host):
+            host = host.get_name()
+        name, aliaslist, addresslist = socket.gethostbyaddr(host)
         if addresslist:
             return addresslist[0]
         return None
@@ -1291,40 +1761,57 @@ class Midget(object):
         """
         return self.reset_midolman_service_on_hosts(hosts=hosts)
 
-    def reset_midolman_service_on_hosts(self, hosts=None):
+    def reset_midolman_service_on_hosts(self, hosts=None, username=None, password=None,
+                                        keypath=None):
         if hosts and not isinstance(hosts, list):
             assert isinstance(hosts, Host)
             hosts = [hosts]
         result = {}
         failed = False
+
         if hosts is None:
-            hosts = self.mapi.get_hosts(query=None) or []
-        self.info('Attetmpting to stop all hosts first...')
-        self.info('Restarting hosts: {0}'.format(",".join(str(x.get_name()) for x in hosts)))
+            try:
+                hosts = self.get_midolman_hosts_from_zk()
+            except Exception as E:
+                self.log.error('Failed to fetch hosts from zookeeper, err: {0}'.format(E))
+                api_hosts = self.mapi.get_hosts(query=None) or []
+                hosts = []
+                for host in api_hosts:
+                    hosts.append(host.get_name())
+        if not hosts:
+            raise ValueError('No hosts provided or found from zookeeper or mido api?')
+        self.info('Attempting to stop all hosts first...')
+        self.info('Restarting hosts: {0}'.format(",".join(hosts)))
         for status in ['stop', 'start']:
             for host in hosts:
+                ip = "None"
                 try:
                     success = True
                     error = None
                     ip = self.get_ip_for_host(host)
-                    euca_host = self.eucaconnection.get_host_by_hostname(ip)
-                    # username = self.clc_connect_kwargs.get('username', 'root')
-                    # password = self.clc_connect_kwargs.get('password')
-                    # keypath = self.clc_connect_kwargs.get('keypath')
-                    # ssh = SshConnection(host=ip, username=username,
-                    #                     password=password, keypath=keypath)
-                    ssh = euca_host.ssh
+                    ssh = self.get_host_ssh(host, username=username, password=password,
+                                            keypath=keypath)
+                    try:
+                        machine = Machine(ssh.host, sshconnection=ssh)
+                        if (machine.distro[0] in ['rhel', 'centos']) and \
+                            (int(machine.distro_ver[0]) > 6):
+                            machine.sys('systemctl restart midolman')
+                            continue
+                    except Exception as SE:
+                        self.log.warn('systemctl failed on host:"{0}", err:{1}\n'
+                                      'Trying init.d now...'.format(host, SE))
                     self.info("Attempting to {0} host:{1} ({2})".format(status,
-                                                                        host.get_name(), ip))
+                                                                        host, ip))
                     ssh.sys('service midolman {0}'.format(status), code=0)
                     time.sleep(1)
                 except Exception as SE:
+                    self.log.warning('\n{0}\n'.format(get_traceback()))
                     failed = True
                     success = False
                     error = str(SE)
-                    self.log.warning('{0}, midolman service failed to:{1}. Err:"{2}"'
-                                     .format(host.get_name(), status, str(SE)))
-                result[host.get_name()] = {'action': status, 'success':success, 'error': error}
+                    self.log.warning('{0}({1}), midolman service failed to:{2}. Err:"{3}"'
+                                     .format(host, ip, status, str(SE)))
+                result[host] = {'action': status, 'success':success, 'error': error}
 
         if failed:
             errors = 'Errors while reseting midolman on hosts:\n'
@@ -1336,6 +1823,33 @@ class Midget(object):
         else:
             self.info('Done restarting midolman on hosts')
         return result
+
+    def get_host_ssh(self, host, username=None, password=None, keypath=None, timeout=10):
+        if isinstance(host, Host):
+            host = host.get_name()
+            if not host:
+                raise RuntimeError('host.get_name() did not return a name?')
+        if not isinstance(host, basestring):
+            raise ValueError('Unkown type for host: "{0}/{1}"'.format(host, type(host)))
+        ip = self.get_ip_for_host(host)
+        for host, info in self._host_connections.iteritems():
+            if host == host or (ip and info.get('ip') == ip):
+                return info.get('ssh')
+        try:
+            euca_host = self.eucaconnection.get_host_by_hostname(ip)
+        except Exception as E:
+            self.log.warning('Error fetching host from eucahost: {0}'.format(E))
+        if not euca_host:
+            username = username or self.eucaconnection.clc_machine.ssh.username
+            password = password or self.eucaconnection.clc_machine.ssh.password
+            keypath = keypath or self.eucaconnection.clc_machine.ssh.keypath
+            ssh = sshconnection.SshConnection(host=ip, username=username,
+                                              password=password, keypath=keypath, timeout=timeout,
+                                              banner_timeout=10)
+        else:
+            ssh = euca_host.ssh
+        self._host_connections[host] = {'ip': ip, 'ssh': ssh}
+        return ssh
 
     def show_host_ports(self, host, printme=True):
         '''
@@ -1615,17 +2129,208 @@ class Midget(object):
         self.show_hosts(hosts=hosts)
 
     def get_euca_vpc_gateway_info(self):
+        midocfg = self.get_euca_mido_config()
+        gatewayhost = midocfg.get('GatewayHost', None)
+        if gatewayhost:
+            gw = {'GatewayHost': gatewayhost}
+            gw['GatewayIP'] = midocfg.get('GatewayIP', None)
+            gw['GatewayInterface'] = midocfg.get('GatewayInterface', None)
+            return [gw]
+        return midocfg.get('Gateways', {})
+
+
+    def get_euca_mido_config(self):
         propname = 'cloud.network.network_configuration'
         prop = self.eucaconnection.get_property(property=propname)
         if not prop:
             raise ValueError('Euca Property not found: {0}'.format(propname))
         value = json_loads(prop.value)
-        try:
-            midocfg = value.get('Mido', {})
-            if not midocfg:
-                self.log.warning("Mido config section not found in euca nework_configuration "
-                                 "property")
-            return midocfg.get('Gateways', {})
-        except KeyError:
-            raise KeyError('get_euca_vpc_gateway_host_addrs: VPC cloud config not found '
-                           'in euca property "network_configuration"')
+        mido_config = value.get('Mido', {})
+        if not mido_config:
+            self.log.warning("Mido config section not found in euca nework_configuration "
+                             "property")
+        return mido_config
+
+
+    def set_bgp_for_peer_via_cli(self, router_name, port_ip, local_as, remote_as, peer_address, route):
+        raise NotImplementedError('Not implemented yet')
+
+    def _show_midolman_config_dict(self, config_dict, section=None, printmethod=None, printme=True):
+        table_width = 100
+        key_len = 24
+        val_len = table_width - key_len - 3
+        buf = ""
+        for section_name, opt_dict in config_dict.iteritems():
+            if section and section_name != section:
+                continue
+            else:
+                buf += markup("\n{0}\n".format(section_name),
+                              [TextStyle.BOLD, TextStyle.UNDERLINE,
+                               ForegroundColor.WHITE, BackGroundColor.BG_BLUE])
+                pt = PrettyTable(['key', 'value'])
+                pt.max_width['key'] = key_len
+                pt.max_width['value'] = val_len
+                pt.align = 'l'
+                pt.border = False
+                pt.header = False
+                for key, val in opt_dict.iteritems():
+                    pt.add_row([str(key).ljust(key_len), str(val).ljust(val_len)])
+                buf += "{0}\n".format(pt)
+        if printme:
+            printmethod = printmethod or self.log.info
+            printmethod(buf)
+        else:
+            return buf
+
+    def show_mido_conf_for_hosts(self, hosts=None, path='/etc/midolman.conf', username=None,
+                              password=None, keypath=None, sshtimeout=10, printmethod=None):
+        printmethod = printmethod or self.log.info
+        if not hosts:
+            try:
+                hosts = self.get_midolman_hosts_from_zk()
+            except Exception as E:
+                self.log.warning('Failed to fetch midolman hosts from zk: {0}'.format(E))
+                try:
+                    hosts = self.mapi.get_hosts()
+                except Exception as E:
+                    self.log.warning('Failed to fetch hosts from Midolman api: {0}'.format(E))
+        if not hosts:
+            raise ValueError('No hosts were provided, and none could be found')
+        if not isinstance(hosts, list):
+            hosts = [hosts]
+        buf = "\n"
+        for host in hosts:
+            ssh_host = None
+            error = None
+            try:
+                if isinstance(host, Host):
+                    host = host.get_name()
+                ssh = self.get_host_ssh(host, username=username, password=password,
+                                        keypath=keypath, timeout=sshtimeout)
+                ssh_host = ssh.host
+                config = self.get_midolman_conf(ssh=ssh)
+            except Exception as E:
+                error = markup('ERROR fetching config:"{0}"\n'.format(E),
+                               [BackGroundColor.BG_WHITE, ForegroundColor.RED])
+            buf += "-".ljust(80, "-")
+            buf += markup('\n\nHOST: {0}\nIP: {1}\nPATH: {2}\n'.format(host, ssh_host, path),
+                         [TextStyle.BOLD, BackGroundColor.BG_BLACK,
+                          ForegroundColor.WHITE])
+            if error:
+                buf += error
+            else:
+                buf += self._show_midolman_config_dict(config, printme=False)
+        printmethod(buf)
+
+    def get_midolman_conf(self, ssh=None, mido_conf='/etc/midolman/midolman.conf', verbose=True):
+        ssh = ssh or self.eucaconnection.clc_machine.ssh
+        buf = ""
+        start = False
+        config_dict = {}
+        for line in ssh.sys('cat {0}'.format(mido_conf), code=0, listformat=True, verbose=verbose):
+            if verbose:
+                self.log.debug(line)
+            if re.search("^\[*.*\]\s*$", line):
+                start = True
+            if start:
+                buf += line + "\n"
+        if buf:
+            sio = StringIO(unicode(buf))
+            try:
+                config = ConfigParser()
+                config.readfp(sio)
+            finally:
+                if sio:
+                    sio.close()
+            for section in config.sections():
+                config_dict[section] = dict(config.items(section))
+        else:
+            self.log.warning('Midonet Config buffer empty')
+        return config_dict
+
+    def get_zk_hosts_from_config(self, mido_config=None):
+        mido_config = mido_config or self.get_midolman_conf()
+        # Get the zookeeper section from a midolman.conf dictionary
+        zk_section = mido_config.get('zookeeper')
+        zk_hosts_string = zk_section.get('zookeeper_hosts', None)
+        hosts = []
+        if not zk_hosts_string:
+            self.log.warn('No zookeeper_hosts option found in mido config dictionary')
+        else:
+            hosts = zk_hosts_string.split(',')
+        return hosts
+
+
+    def show_zk_hosts(self, hosts=None, printmethod=None, printme=True):
+        hosts = hosts or self.get_zk_hosts_from_config()
+        pt = PrettyTable(['HOST', 'PORT', 'STATUS(is ok?)'])
+        for host in hosts:
+            status = None
+            try:
+                client = KazooClient(host)
+                client.start()
+            except Exception as E:
+                status = 'Error creating and starting zookeeper client ' \
+                         'for host: "{0}", err:"{1}"'.format(host, E)
+
+            host, port = client.hosts[0]
+            if not status:
+                status = client.command('ruok')
+            pt.add_row([host, port, status])
+        if printme:
+            printmethod = printmethod or self.log.info
+            printmethod("\n{0}\n".format(pt))
+        else:
+            return pt
+
+    def get_zk_client(self, hosts=None):
+        if not hosts:
+            hosts = self.get_zk_hosts_from_config()
+            if not hosts:
+                raise ValueError('No zookeeper hosts provided and none found?')
+            hosts = ", ".join(hosts)
+        client = KazooClient(hosts)
+        self.log.debug('Attempting to start zk client with hosts:"{0}"'.format(hosts))
+        client.start()
+        return client
+
+    def get_midolman_hosts_from_zk(self):
+        zk = self.get_zk_client()
+        hostnames = []
+        host_ids = zk.get_children('/midonet/v1/hosts/') or []
+        for id in host_ids:
+            data_str, znodstat = zk.get('/midonet/v1/hosts/' + id)
+            if data_str:
+                data = json.loads(data_str)
+                if data:
+                    data = data.get('data', {})
+                    hostname = data.get('name' or None)
+                    if hostname:
+                        hostnames.append(hostname)
+        return hostnames
+
+    def get_midolman_config_from_zk(self, nodes=None):
+        nodes = nodes or ['nsdb', 'cluster', 'agent']
+        if not isinstance(nodes, list):
+            nodes = [nodes]
+        zk = self.get_zk_client()
+        buf = ""
+        for node in nodes:
+            conf =  zk.get('/midonet/v1/config/schemas/{0}'.format(node))
+            if conf:
+                buf += conf[0]
+        return buf
+
+    def show_midolman_bundled_zk_config(self, nodes=None, printmethod=None):
+        printmethod = printmethod or self.log.info
+        printmethod("\n{0}\n".format(self.get_midolman_config_from_zk(nodes=nodes)))
+
+
+
+
+
+
+
+
+
+

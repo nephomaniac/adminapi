@@ -7,7 +7,7 @@ from cloud_utils.log_utils.eulogger import Eulogger
 from cloud_utils.log_utils import get_traceback
 from cloud_utils.log_utils import printinfo, markup
 from cloud_utils.file_utils import render_file_template
-from cloud_utils.net_utils import test_port_status
+from cloud_utils.net_utils import test_port_status, get_network_info_for_cidr
 from cloud_utils.net_utils.sshconnection import (
     CommandExitCodeException,
     SshCbReturn,
@@ -127,6 +127,11 @@ class Machine(object):
 
     @hostname.setter
     def hostname(self, hostname):
+        if self.hostname and self.hostname != hostname:
+            if self.ssh and self.ssh.host != hostname:
+                self.log.debug('Hostname change from {0} -> {1}, setting self.ssh to None'
+                               .format(self.hostname, hostname))
+                self.ssh = None
         self._hostname = hostname
 
     @property
@@ -275,10 +280,19 @@ class Machine(object):
         """
         if not self.ssh:
             raise Exception('Need SSH connection to retrieve distribution info from machine')
+        if self.is_file('/etc/os-release'):
+            try:
+                self.distro  = self.sys('. /etc/os-release && echo "$ID"', code=0)
+                self.distro_ver = self.sys('. /etc/os-release && echo "$VERSION_ID"', code=0)
+                return (self.distro, self.distro_ver)
+            except CommandExitCodeException, CE:
+                self.log.warning('Failed to fetch distro info from /etc/os-release, err:"{0}"'
+                                 .format(CE))
+
         try:
             out = self.sys('cat /etc/issue', listformat=False, code=0, verbose=verbose)
         except CommandExitCodeException, CE:
-            self.log.debug('Failed to fetch /etc/issue from machine:"{0}", err:"{1}"'
+            self.log.warning('Failed to fetch /etc/issue from machine:"{0}", err:"{1}"'
                            .format(self.hostname, str(CE)))
             out = None
         if out:
@@ -366,13 +380,14 @@ class Machine(object):
 
     @property
     def sftp(self):
-        if not self._sftp:
-            self._sftp = self.ssh.connection.open_sftp()
+        if not getattr(self, '_sftp', None):
+            sftp = self.ssh.connection.open_sftp()
+            setattr(self, '_sftp', sftp)
         return self._sftp
 
     @sftp.setter
     def sftp(self, newsftp):
-        self._sftp = newsftp
+        setattr(self, '_sftp', newsftp)
 
     def refresh_ssh(self):
         self.ssh.refresh_connection()
@@ -412,15 +427,31 @@ class Machine(object):
         except:
             pass
 
-    def sys(self, cmd, verbose=True, timeout=120, listformat=True, code=None, net_namespace=None):
+    def sys(self, cmd, verbose=True, timeout=120, listformat=True, code=None,
+            get_pty=True, invoke_shell=False, net_namespace=None):
         '''
         Issues a command against the ssh connection to this instance
-        Returns a list of the lines from stdout+stderr as a result of the command
+        Returns output from stdout+stderr as a result of the command.
+        Issue a command cmd and return output
+
+        :param cmd: - mandatory - string representing the command to be run  against the remote
+                      ssh session
+        :param verbose: - optional - will default to global setting, can be set per cmd() as
+                          well here
+        :param timeout: - optional - integer used to timeout the overall cmd() operation in
+                          case of remote blockingd
+        :param listformat:  - optional - format output into single buffer or list of lines
+
+        :param code: - optional - expected exitcode, will except if cmd's  exitcode does not
+                       match this value
+        :param get_pty: Request a pseudo-terminal from the server.
+        :param invoke_shell: Request a shell session on this channel
+        :param net_namespace: Network name space to issue command in on remote machine
         '''
         if net_namespace is not None:
             cmd = 'ip netns exec {0} {1}'.format(net_namespace, cmd)
         return self.ssh.sys(cmd, verbose=verbose, timeout=timeout, listformat=listformat,
-                            code=code)
+                            get_pty=get_pty, invoke_shell=invoke_shell, code=code)
 
     def cmd(self, cmd, verbose=True, timeout=120, listformat=False, net_namespace=None,
             cb=None, cbargs=[]):
@@ -650,12 +681,19 @@ class Machine(object):
             info_dict['ipcidr'] = None
             info_dict['broadcast'] = None
             info_dict['scope'] = None
+            info_dict['network'] = None
+            info_dict['network_cidr'] = None
             while offset < info_len:
                 word = info[offset]
                 if word == 'inet':
                     offset += 1
                     info_dict['ipcidr'] = info[offset]
-                    info_dict['ip'], info_dict['mask'] = info_dict['ipcidr'].split('/')
+                    info_dict['ip'], mask = info_dict['ipcidr'].split('/')
+                    if info_dict['ipcidr']:
+                        net_info = get_network_info_for_cidr(info_dict['ipcidr']) or {}
+                        info_dict['network'] = net_info.get('network', None)
+                        info_dict['mask'] = net_info.get('netmask')
+                        info_dict['network_cidr'] = "{0}/{1}".format(info_dict['network'], mask)
                 if word == 'brd':
                     offset += 1
                     info_dict['broadcast'] = info[offset]
@@ -679,7 +717,7 @@ class Machine(object):
         pt = PrettyTable(header)
         pt.align = 'l'
         for iface, info in info_dict.iteritems():
-            pt.add_row([iface, info['ipcidr'], info['ip'], info['mask'], info['broadcast'],
+            pt.add_row([iface, info['network_cidr'], info['ip'], info['mask'], info['broadcast'],
                         info['scope']])
         if not printme:
             return pt
@@ -687,10 +725,27 @@ class Machine(object):
         printmethod("\n{0}\n".format(pt))
 
 
-    def get_network_interfaces(self, search_name=None, verbose=False):
+    def get_network_interfaces(self, search_name=None, proc='/proc/net/dev', verbose=False):
         interfaces = {}
         time_stamp = int(time.time())
-        out = self.sys('cat /proc/net/dev', code=0, verbose=verbose)
+        out = None
+        retry = 0
+        orig_verbose = verbose
+        for retry in xrange(0, 5):
+            if retry:
+                verbose = True
+                self.log.debug('Retry:{0}, attempting to fetch data from:"{1}"'
+                               .format(retry, proc))
+                self.sys('ifconfig', verbose=True)
+            out = self.sys('cat {0}'.format(proc), code=0, verbose=verbose)
+            if out:
+                break
+            else:
+                time.sleep(retry + 1)
+        verbose = orig_verbose
+        if not out:
+            raise ValueError('Failed to fetch net interface info from "{0}", output:"{1}", '
+                             'retries:"{2}"'.format(proc, out, retry))
         assert isinstance(out, list)
         header_line = out[0]
         headers = []
@@ -754,7 +809,9 @@ class Machine(object):
         printmethod("\n{0}\n".format(pt))
 
     def get_network_interfaces_delta(self, search_name=None):
-        last = self._net_iface_stats or {}
+        last = getattr(self, '_net_iface_stats', {})
+        if last is None:
+            last = {}
         elapsed = None
         old_interfaces = {}
         new_interfaces = {}
@@ -1228,6 +1285,10 @@ class Machine(object):
     def get_file_userid(self, path):
         return self.sftp.lstat(path).st_uid
 
+    def open_remote_file(self, filepath, mode):
+        f = self.ssh.sftp.file(filepath, mode)
+        return f
+
     @printinfo
     def dd_monitor(self,
                    ddif=None,
@@ -1469,10 +1530,16 @@ class Machine(object):
             if not ret['dd_full_rec_out'] and not ret['dd_partial_rec_out']:
                 raise CommandExitCodeException('Did not transfer any data using dd cmd:' +
                                                str(ddcmd) + "\nstderr: " + str(outbuf))
-            if ((ret['dd_full_rec_in'] != ret['dd_full_rec_out']) or
-                    (ret['dd_partial_rec_out'] != ret['dd_partial_rec_in'])):
+            # Check in vs out, allow for a difference of 1 record...
+            if (abs(int(ret['dd_full_rec_in']) - int(ret['dd_full_rec_out'])) > 1 or
+                    abs(int(ret['dd_partial_rec_out']) - int(ret['dd_partial_rec_in'])) > 1):
                 raise CommandExitCodeException('dd in records do not match out records in '
-                                               'transfer')
+                                               'transfer. full_in:{0}, part_in:{1} != '
+                                               'full_out:{2}, part_out:{3}'
+                                               .format(ret['dd_full_rec_in'],
+                                                       ret['dd_partial_rec_in'],
+                                                       ret['dd_full_rec_out'],
+                                                       ret['dd_partial_rec_out']))
             self.log.debug('Done with dd, copied:{0} bytes, {1} fullrecords, {2} partrecords - '
                            'over elapsed:{3}'.format(ret['dd_bytes'],
                                                      ret['dd_full_rec_out'],
@@ -1514,6 +1581,10 @@ class Machine(object):
         ret = []
         if path is None:
             path = '${PWD}'
+        else:
+            if not (self.is_dir(path) or self.is_file(path)):
+                raise ValueError('Provided path: "{0}" not found on system: "{1}"'
+                                 .format(path, self.hostname))
         if dfargs is None:
             dfargs = ""
         else:

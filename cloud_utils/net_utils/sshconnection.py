@@ -90,7 +90,8 @@ example with proxy:
 """
 
 import copy
-from httplib import HTTPConnection
+from httplib import HTTPConnection, CannotSendRequest
+from cloud_utils.log_utils.eulogger import  Eulogger
 import os
 import paramiko
 from paramiko.sftp_client import SFTPClient
@@ -267,14 +268,15 @@ class SshConnection():
         self.timeout = timeout
         self.banner_timeout = banner_timeout
         self.retry = retry
-        self.log = logger
+        self.log = logger or Eulogger(host)
         self.verbose = verbose
-        self.sftp = None
+        self._sftp = None
         self.key_files = key_files or []
         if not isinstance(self.key_files, types.ListType):
             self.key_files = str(self.key_files).split(',')
         self.find_keys = find_keys
         self.debug_connect = debug_connect
+        self._http_connections = {}
 
         # Used to store the last cmd attempted and it's exit code
         self.lastcmd = ""
@@ -418,9 +420,10 @@ class SshConnection():
             "SSH Command timer fired after " + str(int(elapsed)) + " seconds. Cmd:'" +
             str(cmd) + "'", elapsed=elapsed)
 
-    def sys(self, cmd, verbose=False, timeout=120, listformat=True, enable_debug=False, code=None):
+    def sys(self, cmd, verbose=False, timeout=120, listformat=True, enable_debug=False, code=None,
+            check_alive=True, invoke_shell=False, get_pty=True,):
         """
-        Issue a command cmd and return output in list format
+        Issue a command cmd and return output
 
         :param cmd: - mandatory - string representing the command to be run  against the remote
                       ssh session
@@ -429,11 +432,18 @@ class SshConnection():
         :param timeout: - optional - integer used to timeout the overall cmd() operation in
                           case of remote blockingd
         :param listformat:  - optional - format output into single buffer or list of lines
+
         :param code: - optional - expected exitcode, will except if cmd's  exitcode does not
                        match this value
+        :param check_alive - optional - bool, If true will check if the transport is alive,
+                             and re-establish it if not before attempting to send the command.
+        :param get_pty: Request a pseudo-terminal from the server.
+        :param invoke_shell: Request a shell session on this channel
+
         """
         out = self.cmd(cmd, verbose=verbose, timeout=timeout, listformat=listformat,
-                       enable_debug=enable_debug)
+                       enable_debug=enable_debug, get_pty=get_pty, invoke_shell=invoke_shell,
+                       check_alive=check_alive)
         output = out['output']
         if code is not None and out['status'] != code:
             if verbose:
@@ -453,6 +463,7 @@ class SshConnection():
             invoke_shell=False,
             get_pty=True,
             shell_delay=2,
+            check_alive=True,
             shell_return='\r'):
         """
         Runs a command 'cmd' within an ssh connection.
@@ -487,8 +498,12 @@ class SshConnection():
                     instead of cbargs
         :param cbargs: - optional - list of arguments to be appended to output buffer and
                          passed to cb
+        :param get_pty: Request a pseudo-terminal from the server.
+        :param invoke_shell: Request a shell session on this channel
         :param enable_debug: - optional - boolean, if set will use self.debug() to print
                                additional messages during cmd()
+        :param check_alive - optional - bool, If true will check if the transport is alive,
+                             and re-establish it if not before attempting to send the command.
         """
         if verbose is None:
             verbose = self.verbose
@@ -506,14 +521,29 @@ class SshConnection():
         if verbose:
             self.debug("[" + self.username + "@" + str(self.host) + "]# " + cmd)
         try:
-            tran = self.connection.get_transport()
-            if tran is None or not tran.active:
-                self.debug("SSH transport was None, attempting to restablish ssh to: " +
+
+            if check_alive and not self.is_alive():
+                self.debug("SSH transport was not alive, attempting to restablish ssh to: " +
                            str(self.host))
                 self.refresh_connection()
-                tran = self.connection.get_transport()
 
-            chan = tran.open_session()
+            tran = self.connection.get_transport()
+            attempt = 0
+            while not attempt:
+                try:
+                    chan = tran.open_session(timeout=10)
+                    break
+                except Exception as E:
+                    if not attempt:
+                        self.log.warning('CMD:"{0}", Error while opening channel:{0}'
+                                         .format(cmd, E))
+                        self.log.warning('Attempting to reconnect and open channel again...')
+                        self.refresh_connection()
+                        tran = self.connection.get_transport()
+                        chan = tran.open_session(timeout=10)
+                    else:
+                        raise
+
             try:
                 chan.settimeout(timeout)
                 if get_pty or invoke_shell:
@@ -664,9 +694,24 @@ class SshConnection():
             self.lastexitcode = SshConnection.cmd_timeout_err_code
             elapsed = str(int(time.time() - start))
             self.debug("Command (" + cmd + ") timeout exception after " + str(elapsed) +
-                       " seconds\nException", elapsed=elapsed)
+                       " seconds\nException")
             raise cte
         return ret
+
+    def is_alive(self):
+        """
+        Return info on whether transport is alive.
+        :return: bool
+        """
+        try:
+            if self.connection:
+                transport = self.connection.get_transport()
+                if transport:
+                    transport.send_ignore()
+                    return transport.isAlive() and transport.is_active()
+            return False
+        except EOFError, e:
+            return False
 
     def refresh_connection(self):
         """
@@ -915,11 +960,28 @@ class SshConnection():
             if chan:
                 chan.close()
 
+    @property
+    def sftp(self):
+        if self._sftp:
+            if self._sftp.sock and not self._sftp.sock.closed:
+                return self._sftp
+        else:
+            self._sftp = self.open_sftp()
+        return self._sftp
+
+    @sftp.setter
+    def sftp(self, sftp):
+        if isinstance(sftp, SFTPifc) or sftp is None:
+            self._sftp = sftp
+        else:
+            raise ValueError('sftp must be of types; None or {0}, got:"{1}/{2}"'
+                             .format(SFTPifc.__class__.__name__, sftp, type(sftp)))
+
     def open_sftp(self, transport=None):
         transport = transport or self.connection._transport
         sftp = SFTPifc.from_transport(transport)
         sftp.debug = self.debug
-        self.sftp = sftp
+        self._sftp = sftp
         return sftp
 
     def close_sftp(self):
@@ -990,9 +1052,18 @@ class SshConnection():
         # could connect
         return False
 
+    def _get_dict_id(self, dict_to_hash):
+        """
+        Creates a somewhat unique value from a dictionary of values.
+        The intent is to provide an id for a unique set of dictionary values.
+        :returns int
+        """
+        return int(abs(reduce(lambda x, y: x ^ y,
+                              [hash(item) for item in dict_to_hash.items()])))
+
     def create_http_fwd_connection(self, destport, dest_addr='127.0.0.1', peer=None,
                                    localport=None, trans=None, httpaddr='127.0.0.1',
-                                   **connection_kwargs):
+                                   do_cache=False, **connection_kwargs):
         """
         Create an http connection with port fowarding over this ssh session.
 
@@ -1008,6 +1079,24 @@ class SshConnection():
         assert isinstance(trans, paramiko.Transport)
         if peer is None:
             peer = trans.getpeername()[0]
+        connection_kwargs = connection_kwargs or {}
+        local_arg_dict = {'destport': destport,
+                           'dest_addr': dest_addr,
+                           'peer': peer,
+                           'localport': localport,
+                           'trans': trans,
+                           'httpaddr': httpaddr,
+                            }
+        local_arg_dict.update(connection_kwargs)
+        connection_id = self._get_dict_id(local_arg_dict)
+        # If there is an existing connection return it
+        if connection_id in self._http_connections.keys():
+            http = self._http_connections[connection_id]
+            if http.sock is not None:
+                return {'connection': self._http_connections[connection_id],
+                        'id': connection_id}
+            else:
+                del self._http_connections[connection_id]
         if localport is None:
             localport = self._get_local_unused_port(start=9000)
         self.debug('Making forwarded request from "localhost:{0}" to "{1}:{2}"'
@@ -1016,16 +1105,18 @@ class SshConnection():
                    .format('direct-tcpip', dest_addr, destport, peer, localport))
         chan = trans.open_channel(kind='direct-tcpip', dest_addr=(dest_addr, destport),
                                   src_addr=(peer, localport))
-        connection_kwargs = connection_kwargs or {}
+
         connection_kwargs['host'] = httpaddr
         connection_kwargs['port'] = destport
         self.debug('Creating HTTP connection with kwargs:\n{0}\n'.format(connection_kwargs))
         http = HTTPConnection(**connection_kwargs)
         http.sock = chan
-        return http
+        if do_cache:
+            self._http_connections[connection_id] = http
+        return {'connection': http, 'id': connection_id}
 
     def http_fwd_request(self, url, body=None, headers={}, method='GET', trans=None,
-                         localport=9797, destport=None):
+                         localport=9797, destport=None, cache_connnection=False):
         """
         Attempts to forward a single http request over the current ssh session.
 
@@ -1050,13 +1141,21 @@ class SshConnection():
                  200
             data = response.read()
         """
-        # Todo - Use http connection pools
+        # Todo - Remove the sudo connection caching here(bad), and use http connection pools
         if destport is None:
             urlp = urlparse(url)
             destport = urlp.port or 80
-        http = self.create_http_fwd_connection(destport=destport, dest_addr='127.0.0.1',
-                                               httpaddr='127.0.0.1', localport=localport)
-        req = http.request(method=method, url=url, body=body, headers=headers)
+        conn_dict = self.create_http_fwd_connection(destport=destport, dest_addr='127.0.0.1',
+                                                    httpaddr='127.0.0.1', localport=localport,
+                                                    do_cache=cache_connnection)
+        http = conn_dict.get('connection')
+        conn_id = conn_dict.get('id')
+        try:
+            req = http.request(method=method, url=url, body=body, headers=headers)
+        except CannotSendRequest:
+            if conn_id in self._http_connections:
+                del self._http_connections[conn_id]
+            raise
         status = getattr(req, 'status', None)
         if status:
             self.debug('{0}:{1}, req status:{2}'.format(method, url, status))

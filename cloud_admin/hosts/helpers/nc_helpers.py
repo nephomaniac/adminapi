@@ -272,10 +272,7 @@ class NodeControllerHelpers(EucaMachineHelpers):
         return mpath_dev_info
 
     def get_instance_multipath_dev_for_instance_ebs_volume(self, instance, volume):
-        if not isinstance(instance, types.StringTypes):
-            instance = instance.id
-        if isinstance(volume, types.StringTypes):
-            volume = self.tester.get_volume(volume_id=volume)
+        raise NotImplementedError('This method is incomplete at this time')
 
     def get_instance_multipath_dev_for_instance_block_dev(self, instance, ebs_block_dev,
                                                           verbose=False):
@@ -326,32 +323,75 @@ class NodeControllerHelpers(EucaMachineHelpers):
 
     def get_instance_console_path(self, instance_id):
         if not isinstance(instance_id, types.StringTypes):
-            instance = instance_id.id
+            instance_id = instance_id.id
         dev_dom = self.get_instance_device_xml_dom(instance_id=instance_id)
         console_dom = dev_dom.getElementsByTagName('console')[0]
         return console_dom.getElementsByTagName('source')[0].attributes.get('path').nodeValue
 
     def get_instance_device_xml_dom(self, instance_id):
         if not isinstance(instance_id, types.StringTypes):
-            instance = instance_id.id
+            instance_id = instance_id.id
         dom = self.get_instance_xml_dom(instance_id)
         return dom.getElementsByTagName('devices')[0]
 
     def get_instance_block_disk_xml_dom_list(self, instance_id):
         if not isinstance(instance_id, types.StringTypes):
-            instance = instance_id.id
+            instance_id = instance_id.id
         dev_dom = self.get_instance_xml_dom(instance_id)
         return dev_dom.getElementsByTagName('disk')
 
     def get_instance_xml_dom(self, instance_id):
         if not isinstance(instance_id, types.StringTypes):
-            instance = instance_id.id
+            instance_id = instance_id.id
         output = self.get_instance_xml_text(instance_id)
         dom_xml = parseString(output)
         return dom_xml.getElementsByTagName('domain')[0]
 
     def get_instance_xml_text(self, instance_id):
         if not isinstance(instance_id, types.StringTypes):
-            instance = instance_id.id
+            instance_id = instance_id.id
         return self.eucahost.sys('virsh dumpxml ' + str(instance_id), listformat=False,
                                  verbose=False, code=0)
+
+    def get_libvirt_xsl(self, path='/etc/eucalyptus/libvirt.xsl'):
+        return self.eucahost.sys('cat {0}'.format(path), listformat=False, verbose=False, code=0)
+
+    def enable_vnc_for_new_instances(self, listen='0.0.0.0', autoport='yes', keymap='en-us',
+                                     port='-1', path='/etc/eucalyptus/libvirt.xsl'):
+        vnc_line = "<graphics type='vnc' port='-1' autoport='yes' keymap='en-us'/>"
+        current_xsl = self.get_libvirt_xsl(path=path)
+        new_xsl = ''
+        for line in current_xsl.splitlines():
+            if re.search("graphics\s+type='vnc'", line):
+                m = re.search("^\s+", line)
+                space = '                '
+                if m:
+                    space = m.group()
+                line = "{0}<graphics type='vnc' port='{1}' autoport='{2}' keymap='{3}' " \
+                       "listen='{4}'/>".format(space, port, autoport, keymap, listen)
+            new_xsl += str(line) + "\n"
+        new_file = None
+        dir = os.path.dirname(path)
+        new_file_path = os.path.join(dir, 'nephoria_temp_xsl')
+        backup_file_path = os.path.join(dir, "{0}.backup".format(os.path.basename(path)))
+        backup_file_path.strip('*')
+        try:
+            new_file = self.eucahost.ssh.sftp.file(new_file_path, 'w')
+            new_file.write(new_xsl)
+        finally:
+            if new_file:
+                new_file.close()
+        if self.eucahost.is_file(backup_file_path):
+            self.eucahost.sys('rm -f {0}'.format(backup_file_path))
+        self.eucahost.sys('cp {0} {1}'.format(path, backup_file_path))
+        self.eucahost.sys('mv {0} {1}'.format(new_file_path, path))
+        self.log.debug('Done re-writing {0} on {1}'.format(path, self.eucahost.hostname))
+
+    def get_vncdisplay_for_instance(self, instance, verbose=False):
+        if not isinstance(instance, basestring):
+            instance = instance.id
+        out = self.eucahost.sys('virsh vncdisplay {0}'.format(instance), verbose=verbose, code=0)
+        if out:
+            vnc_port = out[0].strip()
+            return "{0}{1}".format(self.eucahost.hostname, vnc_port)
+        return None
